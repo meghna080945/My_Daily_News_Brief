@@ -25,8 +25,9 @@ from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 import certifi
 import feedparser
-import google.generativeai as genai
 from dotenv import load_dotenv
+from google import genai
+from google.genai import types
 from supabase import create_client
 
 # --- Feed configuration ------------------------------------------------------
@@ -81,9 +82,14 @@ GEMINI_PROMPT = (
     "2. CATEGORIZE: Assign each kept story to exactly ONE category — the single "
     "most fitting one from this list: {categories}. The suggested category is "
     "only a hint; override it if another category fits better.\n"
-    "3. SUMMARIZE: For each kept story, write exactly three sentences: one on what "
-    "happened, one on why it signals a bigger trend, and one on why it matters right now. Summarize ONLY what is stated in the "
-    "source text; do not infer or add facts. Skip anything irrelevant.\n"
+    "3. SUMMARIZE: For each kept story, write exactly three lines in a "
+    "question-and-answer form, each a single sentence, separated by newline "
+    "characters (\\n). Use exactly these questions as the prefix of each line:\n"
+    "   What happened: <one sentence>\n"
+    "   Why it signals a bigger trend: <one sentence>\n"
+    "   Why it matters now: <one sentence>\n"
+    "Summarize ONLY what is stated in the source text; do not infer or add "
+    "facts. Skip anything irrelevant.\n"
     "Return only valid JSON: an array of objects with fields headline, summary, "
     "source_url, source_name, category. Use the source_url of the single article "
     "you kept for each event."
@@ -228,12 +234,10 @@ def fetch_articles():
     return articles
 
 
-def summarize_with_gemini(articles):
-    """Send articles to Gemini 2.5 Flash and return a list of story dicts."""
+def summarize_with_gemini(client, articles):
+    """Send articles to Gemini and return a list of story dicts."""
     if not articles:
         return []
-
-    model = genai.GenerativeModel("gemini-flash-latest")
 
     # Give the model a compact, structured view of the source text.
     payload = [
@@ -251,9 +255,12 @@ def summarize_with_gemini(articles):
     prompt = f"{instructions}\n\nArticles:\n{json.dumps(payload, ensure_ascii=False)}"
 
     try:
-        response = model.generate_content(
-            prompt,
-            generation_config={"response_mime_type": "application/json"},
+        response = client.models.generate_content(
+            model="gemini-flash-latest",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+            ),
         )
         text = response.text.strip()
         stories = json.loads(text)
@@ -348,6 +355,30 @@ def upsert_stories(supabase, stories):
 
 # --- Email -------------------------------------------------------------------
 
+def render_summary(summary):
+    """Render a Q&A summary (one ``Question: answer`` per line) as HTML rows.
+
+    Each newline-separated line becomes its own row with the question part
+    bolded. A line without a colon is rendered as-is, so the output degrades
+    gracefully if the model returns plain sentences.
+    """
+    rows = []
+    for line in summary.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        question, sep, answer = line.partition(":")
+        if sep:
+            rows.append(
+                f'<div style="margin:0 0 6px 0;">'
+                f'<strong style="color:#111827;">{escape(question.strip())}:</strong> '
+                f'{escape(answer.strip())}</div>'
+            )
+        else:
+            rows.append(f'<div style="margin:0 0 6px 0;">{escape(line)}</div>')
+    return "".join(rows)
+
+
 def build_email_html(stories, date_label):
     """Render the day's stories as an HTML email, grouped by category.
 
@@ -368,7 +399,7 @@ def build_email_html(stories, date_label):
         cards = []
         for story in grouped[category]:
             headline = escape(story["headline"])
-            summary = escape(story["summary"])
+            summary = render_summary(story["summary"])
             source_name = escape(story["source_name"])
             url = escape(story["source_url"], quote=True)
             cards.append(
@@ -405,7 +436,7 @@ def build_email_html(stories, date_label):
                font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
     <div style="max-width:640px;margin:0 auto;padding:28px 20px;">
       <div style="margin:0 0 4px 0;font-size:24px;font-weight:800;color:#111827;">
-        Your Daily News Brief
+        Meghna's Daily Brief - {len(stories)} briefs
       </div>
       <div style="font-size:14px;color:#6b7280;margin:0 0 6px 0;">{escape(date_label)}</div>
       <div style="display:inline-block;font-size:12px;color:#6b7280;
@@ -447,10 +478,7 @@ def send_brief_email(stories):
     html = build_email_html(stories, date_label)
 
     message = EmailMessage()
-    message["Subject"] = (
-        f"Good morning, Meghna!"
-        f"{date_label}"
-    )
+    message["Subject"] = "Good Morning! How are you feeling today?"
     message["From"] = gmail_address
     message["To"] = gmail_address
     message.set_content(
@@ -493,15 +521,15 @@ def main():
         print(f"[fatal] missing environment variable(s): {', '.join(missing)}", file=sys.stderr)
         sys.exit(1)
 
-    genai.configure(api_key=gemini_key)
+    gemini = genai.Client(api_key=gemini_key)
     supabase = create_client(supabase_url, supabase_key)
 
     print("Fetching articles from the last 24 hours...")
     articles = fetch_articles()
     print(f"Collected {len(articles)} recent article(s) across all feeds.")
 
-    print("Summarizing with Gemini 2.5 Flash...")
-    stories = summarize_with_gemini(articles)
+    print("Summarizing with Gemini...")
+    stories = summarize_with_gemini(gemini, articles)
     print(f"Gemini returned {len(stories)} story summar(ies).")
 
     # Determine which stories are new (not already emailed in the last 24h)
